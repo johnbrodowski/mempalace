@@ -209,6 +209,29 @@ LIMIT @limit";
         return Convert.ToInt32(cmd.ExecuteScalar()!);
     }
 
+    /// <summary>
+    /// Returns chunks that do not yet have a stored embedding, optionally filtered
+    /// by domain and/or topic. Used by the retroactive 'embed' command.
+    /// </summary>
+    public IReadOnlyList<ChunkRecord> GetChunksWithoutEmbeddings(
+        string? domain = null, string? topic = null)
+    {
+        using var conn = Open();
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+
+        var where = new List<string> { "c.id NOT IN (SELECT chunk_id FROM chunk_embeddings)" };
+        if (domain is not null) { where.Add("c.domain = @domain"); cmd.Parameters.AddWithValue("@domain", domain); }
+        if (topic  is not null) { where.Add("c.topic  = @topic");  cmd.Parameters.AddWithValue("@topic",  topic); }
+
+        cmd.CommandText =
+            $"SELECT id, domain, topic, category, source_file, content, chunk_index, added_by, filed_at " +
+            $"FROM chunks c WHERE {string.Join(" AND ", where)} " +
+            $"ORDER BY domain, topic, source_file, chunk_index";
+
+        return ReadChunks(cmd);
+    }
+
     public IReadOnlyList<string> GetDomains()
     {
         using var conn = Open();
@@ -357,6 +380,49 @@ SELECT content, domain, topic, category, source_file, id FROM chunks";
             var vec   = new float[bytes.Length / sizeof(float)];
             Buffer.BlockCopy(bytes, 0, vec, 0, bytes.Length);
             results.Add((id, vec));
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Fetch stored embeddings joined with chunk metadata in a single query.
+    /// Returns one row per embedding, ordered by domain then topic then source_file.
+    /// </summary>
+    public IReadOnlyList<EmbeddingRow> GetEmbeddingsWithMeta(
+        string? domain = null, string? topic = null)
+    {
+        using var conn = Open();
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+
+        var where = new List<string>();
+        if (domain is not null) { where.Add("c.domain = @domain"); cmd.Parameters.AddWithValue("@domain", domain); }
+        if (topic  is not null) { where.Add("c.topic  = @topic");  cmd.Parameters.AddWithValue("@topic",  topic); }
+        var whereClause = where.Count > 0 ? "WHERE " + string.Join(" AND ", where) : "";
+
+        cmd.CommandText =
+            $"SELECT e.chunk_id, e.embedding, c.domain, c.topic, c.source_file, c.content " +
+            $"FROM chunk_embeddings e " +
+            $"JOIN chunks c ON e.chunk_id = c.id " +
+            $"{whereClause} " +
+            $"ORDER BY c.domain, c.topic, c.source_file";
+
+        var results = new List<EmbeddingRow>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var bytes   = (byte[])reader.GetValue(1);
+            var vec     = new float[bytes.Length / sizeof(float)];
+            Buffer.BlockCopy(bytes, 0, vec, 0, bytes.Length);
+            var content = reader.GetString(5);
+            results.Add(new EmbeddingRow(
+                ChunkId : reader.GetString(0),
+                Embedding: vec,
+                Domain  : reader.GetString(2),
+                Topic   : reader.GetString(3),
+                Title   : reader.IsDBNull(4) ? "unknown" : Path.GetFileName(reader.GetString(4)),
+                Snippet : content.Length > 120 ? content[..120] + "…" : content
+            ));
         }
         return results;
     }

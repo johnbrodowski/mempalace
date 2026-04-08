@@ -49,17 +49,19 @@ public static class Cli
 
             return args[0].ToLowerInvariant() switch
             {
-                "init"     => await RunInit(config, db, args),
-                "mine"     => await RunMine(config, db, miner, args),
-                "search"   => await RunSearch(searcher, args),
-                "status"   => await RunStatus(config, db, layers),
-                "wake-up"  => await RunWakeUp(layers, args),
-                "compress" => RunCompress(args),
-                "split"    => await RunSplit(args),
-                "repair"   => RunRepair(db),
-                "onboard"  => await RunOnboard(config, db, args),
-                "mcp"      => await RunMcp(config, db, kg, searcher, graph, layers),
-                _          => UnknownCommand(args[0])
+                "init"       => await RunInit(config, db, args),
+                "mine"       => await RunMine(config, db, miner, args),
+                "search"     => await RunSearch(searcher, args),
+                "embed"      => await RunEmbed(db, embedder, args),
+                "embeddings" => await RunEmbeddings(db, embedder, args),
+                "status"     => await RunStatus(config, db, layers),
+                "wake-up"    => await RunWakeUp(layers, args),
+                "compress"   => RunCompress(args),
+                "split"      => await RunSplit(args),
+                "repair"     => RunRepair(db),
+                "onboard"    => await RunOnboard(config, db, args),
+                "mcp"        => await RunMcp(config, db, kg, searcher, graph, layers),
+                _            => UnknownCommand(args[0])
             };
         }
         catch (Exception ex)
@@ -113,6 +115,146 @@ public static class Cli
             foreach (var (topic, count) in r.TopicCounts.OrderByDescending(x => x.Value))
                 Console.WriteLine($"  {topic}: {count}");
         }
+        return 0;
+    }
+
+    // ── embed (retroactive) ───────────────────────────────────────────────────
+
+    private static async Task<int> RunEmbed(
+        DatabaseService db, EmbeddingService? embedder, string[] args)
+    {
+        if (embedder is null)
+        {
+            Console.Error.WriteLine("Embedding model not loaded. Remove --no-embed and try again.");
+            return 1;
+        }
+
+        var domain  = ParseFlag(args, "--domain");
+        var topic   = ParseFlag(args, "--topic");
+        var batchSS = ParseFlag(args, "--batch");
+        int batchSz = batchSS is not null && int.TryParse(batchSS, out var b) ? b : 32;
+
+        var pending = db.GetChunksWithoutEmbeddings(domain, topic);
+        if (pending.Count == 0)
+        {
+            Console.WriteLine("All chunks already have embeddings.");
+            return 0;
+        }
+
+        Console.WriteLine($"Embedding {pending.Count} chunks (batch size {batchSz})…");
+        int done = 0, errors = 0;
+
+        for (int i = 0; i < pending.Count; i += batchSz)
+        {
+            var batch = pending.Skip(i).Take(batchSz).ToList();
+            var texts = batch.Select(c => c.Content).ToList();
+
+            try
+            {
+                var vecs = await Task.Run(() => embedder.EmbedBatch(texts));
+                for (int j = 0; j < batch.Count; j++)
+                    db.UpsertEmbedding(batch[j].Id, vecs[j]);
+                done += batch.Count;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"  [batch {i/batchSz + 1}] error: {ex.Message}");
+                errors += batch.Count;
+            }
+
+            Console.Write($"\r  {done + errors}/{pending.Count}  ({done} ok, {errors} errors)   ");
+        }
+
+        Console.WriteLine($"\nDone. {done} embeddings stored, {errors} errors.");
+        return errors > 0 ? 1 : 0;
+    }
+
+    // ── embeddings ───────────────────────────────────────────────────────────
+
+    private static async Task<int> RunEmbeddings(
+        DatabaseService db, EmbeddingService? embedder, string[] args)
+    {
+        var domain  = ParseFlag(args, "--domain");
+        var topic   = ParseFlag(args, "--topic");
+        var query   = ParseFlag(args, "--query");
+        var limitS  = ParseFlag(args, "--limit");
+        var dimsS   = ParseFlag(args, "--dims");
+        int limit   = limitS is not null && int.TryParse(limitS, out var l) ? l : (query is null ? 20 : 10);
+        int dims    = dimsS  is not null && int.TryParse(dimsS,  out var d) ? d : 8;
+
+        int total = db.GetEmbeddingCount();
+        int chunks = db.GetChunkCount();
+
+        Console.WriteLine($"Stored embeddings: {total:N0} / {chunks:N0} chunks " +
+                          $"({(chunks == 0 ? 0 : 100.0 * total / chunks):F0}% coverage)");
+
+        if (total == 0)
+        {
+            Console.WriteLine("No embeddings stored yet. Run 'mine' without --no-embed to generate them.");
+            return 0;
+        }
+
+        // ── Query mode: rank all embeddings by cosine similarity ──────────────
+        if (query is not null)
+        {
+            if (embedder is null)
+            {
+                Console.Error.WriteLine("--query requires the embedding model. Remove --no-embed and try again.");
+                return 1;
+            }
+
+            Console.WriteLine($"Query: \"{query}\"");
+            Console.WriteLine();
+
+            var queryVec = await Task.Run(() => embedder.Embed(query));
+            var rows     = db.GetEmbeddingsWithMeta(domain, topic);
+
+            var ranked = rows
+                .Select(r => (Row: r, Sim: EmbeddingService.CosineSimilarity(queryVec, r.Embedding)))
+                .OrderByDescending(x => x.Sim)
+                .Take(limit)
+                .ToList();
+
+            // Header
+            Console.WriteLine($"  {"SIM",5}  {"DOMAIN",-16} {"TOPIC",-14} {"TITLE",-30}  SNIPPET");
+            Console.WriteLine(new string('─', 100));
+
+            foreach (var (row, sim) in ranked)
+            {
+                var snippet = row.Snippet.Replace('\n', ' ').Replace('\r', ' ');
+                if (snippet.Length > 60) snippet = snippet[..60] + "…";
+                Console.WriteLine(
+                    $"  {sim,5:F3}  {row.Domain,-16} {row.Topic,-14} {row.Title,-30}  {snippet}");
+            }
+
+            return 0;
+        }
+
+        // ── List mode: show embeddings with vector preview ────────────────────
+        Console.WriteLine();
+
+        var allRows = db.GetEmbeddingsWithMeta(domain, topic);
+        var page    = allRows.Take(limit).ToList();
+
+        // Column header
+        var dimHeader = string.Concat(Enumerable.Range(0, dims).Select(i => $"  d{i,3}"));
+        Console.WriteLine($"  {"ID",-10} {"DOMAIN",-16} {"TOPIC",-14} {"TITLE",-28} {"NORM",5}{dimHeader}");
+        Console.WriteLine(new string('─', 40 + 16 + 14 + 28 + 6 + dims * 7));
+
+        foreach (var row in page)
+        {
+            var vec  = row.Embedding;
+            float norm = MathF.Sqrt(vec.Sum(x => x * x));
+            var dimValues = string.Concat(
+                vec.Take(dims).Select(v => $"  {v,5:F3}"));
+            var shortId = row.ChunkId.Length > 8 ? row.ChunkId[..8] : row.ChunkId;
+            Console.WriteLine(
+                $"  {shortId,-10} {row.Domain,-16} {row.Topic,-14} {row.Title,-28} {norm,5:F3}{dimValues}");
+        }
+
+        if (allRows.Count > limit)
+            Console.WriteLine($"\n  … {allRows.Count - limit} more (use --limit to show more)");
+
         return 0;
     }
 
@@ -298,6 +440,16 @@ public static class Cli
                 --domain <name>           Filter by domain
                 --topic  <name>           Filter by topic
                 --limit <n>               Max results (default: 10)
+              embed [flags]               Retroactively embed chunks that have no embedding yet
+                --domain <name>           Filter by domain
+                --topic  <name>           Filter by topic
+                --batch  <n>              ONNX batch size (default: 32)
+              embeddings [flags]          Inspect stored embeddings
+                --domain <name>           Filter by domain
+                --topic  <name>           Filter by topic
+                --limit  <n>              Max rows to show (default: 20)
+                --dims   <n>              Number of vector dimensions to display (default: 8)
+                --query  <text>           Rank all embeddings by cosine similarity to this text
               --no-embed                  Skip loading the embedding model (BM25-only, faster cold start)
               status                      Show store stats
               wake-up [--domain <name>]   Print 4-layer memory context

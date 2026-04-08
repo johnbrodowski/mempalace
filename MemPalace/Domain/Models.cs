@@ -147,3 +147,16 @@ public sealed class PersonEntry
     public string Relationship { get; init; } = "unknown";
     public string Code { get; init; } = "";
 }
+
+/// <summary>
+/// One row from chunk_embeddings joined with its parent chunk metadata.
+/// Returned by <see cref="DatabaseService.GetEmbeddingsWithMeta"/>.
+/// </summary>
+public sealed record EmbeddingRow(
+    string  ChunkId,
+    float[] Embedding,
+    string  Domain,
+    string  Topic,
+    string  Title,
+    string  Snippet
+);
